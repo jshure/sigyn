@@ -31,7 +31,7 @@
     }
   },
   "exporter": {
-    "listen_address": ":8081",
+    "listen_address": ":8080",
     "opensearch": {
       "endpoint": "https://search-my-log-domain.us-west-2.es.amazonaws.com",
       "index_prefix": "exported-logs-",

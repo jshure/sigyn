@@ -17,7 +17,7 @@ graph TD
         Buffer[Memory Buffer + WAL]
         Broker[Live Tail Broker]
         IdxWriter[Label Index Writer]
-        Exporter[Exporter + Query API<br/>:8081]
+        Exporter[Exporter + Query API<br/>:8080]
         Pool[Worker Pool<br/>Bounded Concurrency]
         Registry[Job Registry]
         QueryEngine[Query Engine]
@@ -185,10 +185,10 @@ This builds the project, starts MinIO + OpenSearch via Docker, launches both ser
 ```bash
 make dev-up          # Start MinIO + OpenSearch
 make run-ingester    # Start ingester on :3100 (terminal 1)
-make run-exporter    # Start exporter on :8081 (terminal 2)
+make run-exporter    # Start exporter on :8080 (terminal 2)
 ```
 
-Open the web UI: **http://localhost:8081/ui**
+Open the web UI: **http://localhost:8080/ui**
 
 MinIO console: `http://localhost:9001` (minioadmin/minioadmin)
 
@@ -232,7 +232,7 @@ Entries are sent in batches of 500. The script exits on the first non-202 respon
 
 ```bash
 # Search by labels and time range
-curl 'http://localhost:8081/query?start=2026-03-23T00:00:00Z&end=2026-03-24T00:00:00Z&query={app="nginx",env="prod"}&level=error&limit=100'
+curl 'http://localhost:8080/query?start=2026-03-23T00:00:00Z&end=2026-03-24T00:00:00Z&query={app="nginx",env="prod"}&level=error&limit=100'
 ```
 
 Response:
@@ -252,7 +252,7 @@ Response:
 
 ### Query Logs (Web UI)
 
-Open **http://localhost:8081/ui** and use:
+Open **http://localhost:8080/ui** and use:
 - Time range pickers for start/end
 - Label query field: `{app="nginx", env="prod"}`
 - Level filter dropdown
@@ -270,7 +270,7 @@ Entries stream as JSON, one per message.
 
 ```bash
 # Start an export job
-curl -X POST http://localhost:8081/export \
+curl -X POST http://localhost:8080/export \
   -H "Content-Type: application/json" \
   -d '{
     "start_time": "2026-03-23T00:00:00Z",
@@ -280,13 +280,13 @@ curl -X POST http://localhost:8081/export \
   }'
 
 # Poll job status
-curl http://localhost:8081/export/<job-id>
+curl http://localhost:8080/export/<job-id>
 
 # List all jobs
-curl http://localhost:8081/export
+curl http://localhost:8080/export
 
 # Cancel a running job
-curl -X DELETE http://localhost:8081/export/<job-id>
+curl -X DELETE http://localhost:8080/export/<job-id>
 ```
 
 ## Label Index
@@ -417,7 +417,7 @@ Configuration is JSON with `${ENV_VAR}` expansion.
     }
   },
   "exporter": {
-    "listen_address": ":8081",
+    "listen_address": ":8080",
     "opensearch": {
       "endpoint": "https://my-cluster.example.com",
       "index_prefix": "exported-logs-",
@@ -470,7 +470,7 @@ Config is validated on startup — missing required fields or invalid values wil
 | `GET` | `/health` | Health check |
 | `WS` | `/tail?query={...}&level=...` | Live tail via WebSocket |
 
-### Exporter (default `:8081`)
+### Exporter (default `:8080`)
 
 | Method | Path | Description |
 |--------|------|-------------|

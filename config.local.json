@@ -33,7 +33,7 @@
     }
   },
   "exporter": {
-    "listen_address": ":8081",
+    "listen_address": ":8080",
     "opensearch": {
       "endpoint": "http://localhost:9200",
       "index_prefix": "exported-logs-",

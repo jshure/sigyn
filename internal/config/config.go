@@ -122,7 +122,7 @@ func (c *Config) applyDefaults() {
 		c.Ingester.MaxEntriesPerReq = 10000
 	}
 	if c.Exporter.ListenAddress == "" {
-		c.Exporter.ListenAddress = ":8081"
+		c.Exporter.ListenAddress = ":8080"
 	}
 	if c.Exporter.DefaultBatchSize <= 0 {
 		c.Exporter.DefaultBatchSize = 1000

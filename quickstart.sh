@@ -22,7 +22,7 @@ go run ./cmd/ingester config.local.json &
 INGESTER_PID=$!
 sleep 2
 
-echo "[4/5] Starting exporter on :8081..."
+echo "[4/5] Starting exporter on :8080..."
 go run ./cmd/exporter config.local.json &
 EXPORTER_PID=$!
 sleep 2
@@ -43,13 +43,13 @@ curl -s -X POST http://localhost:3100/logs \
 echo ""
 echo "=== sigyn is running ==="
 echo ""
-echo "  Web UI:        http://localhost:8081/ui"
+echo "  Web UI:        http://localhost:8080/ui"
 echo "  Ingester:      http://localhost:3100 (POST /logs, WS /tail)"
-echo "  Exporter:      http://localhost:8081 (GET /query, POST /export)"
+echo "  Exporter:      http://localhost:8080 (GET /query, POST /export)"
 echo "  MinIO Console: http://localhost:9001 (minioadmin/minioadmin)"
 echo "  Metrics:       http://localhost:9090/metrics"
 echo ""
-echo "  Try: curl 'http://localhost:8081/query?start=2020-01-01T00:00:00Z&end=2030-01-01T00:00:00Z&limit=10'"
+echo "  Try: curl 'http://localhost:8080/query?start=2020-01-01T00:00:00Z&end=2030-01-01T00:00:00Z&limit=10'"
 echo "  Try: wscat -c 'ws://localhost:3100/tail'"
 echo ""
 echo "Press Ctrl+C to stop."

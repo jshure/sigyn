@@ -31,6 +31,13 @@ pick() {
   echo "${arr[$((RANDOM % ${#arr[@]}))]}"
 }
 
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
 rand_range() {
   echo $(( $1 + RANDOM % ($2 - $1 + 1) ))
 }
@@ -137,7 +144,7 @@ while (( SENT < TOTAL )); do
     fi
     labels+="}"
 
-    entry="{\"timestamp\":\"${ts_fmt}\",\"service\":\"${svc}\",\"level\":\"${level}\",\"message\":$(printf '%s' "$msg" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"labels\":${labels}}"
+    entry="{\"timestamp\":\"${ts_fmt}\",\"service\":\"${svc}\",\"level\":\"${level}\",\"message\":$(json_escape "$msg"),\"labels\":${labels}}"
 
     if (( i > 0 )); then entries+=","; fi
     entries+="$entry"
