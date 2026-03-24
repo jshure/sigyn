@@ -15,15 +15,20 @@ graph TD
         MW[Middleware Stack<br/>Auth · Rate Limit · Body Limit · Access Log]
         Ingester[Log Ingester API<br/>:8080]
         Buffer[Memory Buffer + WAL]
-        Exporter[OpenSearch Exporter<br/>:8081]
+        Broker[Live Tail Broker]
+        IdxWriter[Label Index Writer]
+        Exporter[Exporter + Query API<br/>:8081]
         Pool[Worker Pool<br/>Bounded Concurrency]
         Registry[Job Registry]
+        QueryEngine[Query Engine]
+        WebUI[Web UI]
         Metrics[Prometheus Metrics<br/>:9090]
     end
 
     subgraph Storage
-        S3[(AWS S3 Bucket<br/>Compressed Chunks)]
-        OS[(OpenSearch Cluster<br/>Fully Indexed)]
+        S3[(AWS S3<br/>Compressed Chunks)]
+        Idx[(S3 Label Index<br/>Chunk Metadata)]
+        OS[(OpenSearch<br/>Fully Indexed)]
         WAL[(WAL on Disk<br/>Crash Recovery)]
     end
 
@@ -31,14 +36,22 @@ graph TD
     App2 -->|JSON Logs| MW
     MW --> Ingester
     Ingester --> Buffer
+    Ingester --> Broker
     Buffer --> WAL
     Buffer -->|Flush & Compress| S3
+    Buffer --> IdxWriter
+    IdxWriter -->|Write Index| Idx
 
-    Admin((Admin/User)) -->|Export Request<br/>POST /export| Exporter
-    Exporter --> Pool
+    Admin((Admin/User)) --> WebUI
+    WebUI -->|Search| QueryEngine
+    WebUI -->|Live Tail WS| Broker
+    QueryEngine -->|Read Index| Idx
+    QueryEngine -->|Fetch Chunks| S3
+
+    Admin -->|POST /export| Pool
     Pool --> Registry
-    Pool -->|Fetch Relevant Chunks| S3
-    Pool -->|Index Filtered Logs| OS
+    Pool -->|Fetch Chunks| S3
+    Pool -->|Bulk Index| OS
 ```
 
 ### Data Flow
@@ -50,6 +63,9 @@ sequenceDiagram
     participant Ingester as Ingester (Go)
     participant WAL as Write-Ahead Log
     participant S3 as AWS S3
+    participant Idx as S3 Label Index
+    participant UI as Web UI
+    participant Query as Query Engine
     participant Exporter as Exporter (Go)
     participant OS as OpenSearch
 
@@ -60,21 +76,35 @@ sequenceDiagram
     MW->>Ingester: Forward
     Ingester->>WAL: Append entries (fsync)
     Ingester-->>App: 202 Accepted
-    Ingester->>Ingester: Buffer in memory
+    Ingester->>Ingester: Buffer + collect label sets
     Ingester->>Ingester: Compress (gzip/snappy)
-    Ingester->>S3: PutObject (with retries)
+    Ingester->>S3: PutObject (chunk, with retries)
+    Ingester->>Idx: Write index (labels, time range)
     Ingester->>WAL: Truncate on success
     end
 
     rect rgb(220, 240, 200)
-    note right of App: Selective Export
+    note right of UI: Query (via Web UI or API)
+    UI->>Query: GET /query?query={app="nginx"}&start=...&end=...
+    Query->>Idx: List & read index files (by day)
+    Idx-->>Query: Matching chunk metadata
+    Query->>S3: GetObject (only matching chunks)
+    S3-->>Query: Compressed data
+    Query->>Query: Decompress & filter entries
+    Query-->>UI: JSON response + stats
+    end
+
+    rect rgb(240, 220, 200)
+    note right of UI: Live Tail (WebSocket)
+    UI->>Ingester: WS /tail?query={app="nginx"}
+    Ingester-->>UI: Stream matching entries in real-time
+    end
+
+    rect rgb(230, 230, 240)
+    note right of App: Selective Export to OpenSearch
     Admin->>Exporter: POST /export (criteria)
-    Exporter->>Exporter: Submit to worker pool
     Exporter-->>Admin: 202 Accepted (job ID)
-    Exporter->>S3: ListObjects (time range)
-    S3-->>Exporter: Return keys
-    Exporter->>S3: GetObject (fetch chunks)
-    Exporter->>Exporter: Decompress & Filter
+    Exporter->>S3: Fetch matching chunks
     Exporter->>OS: Bulk Index (with retries)
     Admin->>Exporter: GET /export/{id}
     Exporter-->>Admin: Job status + progress
@@ -85,44 +115,51 @@ sequenceDiagram
 
 **Store everything, index selectively.** Traditional log systems index every line on ingest, which gets expensive fast. lokilike takes a different approach:
 
-1. **Ingest cheaply** — logs are buffered in memory (with a WAL for crash safety), compressed, and flushed to S3. S3 is the source of truth.
-2. **Export on demand** — an export job scans relevant S3 chunks (scoped by time, service, labels), decompresses them, filters, and pushes only matching logs to OpenSearch.
-
-This means you pay S3 prices for retention and OpenSearch prices only for what you're investigating.
+1. **Ingest cheaply** — logs are buffered in memory (with a WAL for crash safety), compressed, and flushed to S3. A minimal label index is written alongside each chunk. S3 is the source of truth.
+2. **Query directly** — the query engine reads the label index to identify relevant chunks, fetches only those, decompresses, and filters. No external database needed for ad-hoc searches.
+3. **Export on demand** — for deep analysis, an export job pushes matching logs to OpenSearch. You pay OpenSearch prices only for what you're investigating.
+4. **Tail live** — a WebSocket endpoint streams entries in real-time as they're ingested, filtered by labels and level.
 
 ## Project Structure
 
 ```
 lokilike/
 ├── cmd/
-│   ├── ingester/main.go           # Ingestion server
-│   └── exporter/main.go           # Export worker + job API
+│   ├── ingester/main.go            # Ingestion server + /tail WebSocket
+│   └── exporter/
+│       ├── main.go                  # Export worker + query API + web UI
+│       └── web/index.html           # Embedded web UI (SPA)
 ├── internal/
-│   ├── config/config.go           # Config with validation + defaults
+│   ├── config/config.go             # Config with validation + defaults
 │   ├── domain/
-│   │   ├── log_entry.go           # LogEntry struct
-│   │   ├── chunk.go               # Chunk + compression types
-│   │   └── export_job.go          # ExportJob lifecycle
+│   │   ├── log_entry.go             # LogEntry struct
+│   │   ├── chunk.go                 # Chunk + compression types + label sets
+│   │   └── export_job.go            # ExportJob lifecycle
 │   ├── ingester/
-│   │   ├── buffer.go              # Buffer with WAL, level sampling, flush-failure retention
-│   │   ├── handler.go             # POST /logs with entry limits
-│   │   ├── s3_flusher.go          # S3 writer with retries
-│   │   └── wal.go                 # Write-ahead log for crash recovery
+│   │   ├── buffer.go                # Buffer with WAL, label collection, level sampling
+│   │   ├── handler.go               # POST /logs with entry limits
+│   │   ├── s3_flusher.go            # S3 writer with retries + index writing
+│   │   ├── wal.go                   # Write-ahead log for crash recovery
+│   │   └── broker.go                # Pub/sub fan-out for live tail
 │   ├── exporter/
-│   │   ├── exporter.go            # S3 scan, decompress, filter, export with retries
-│   │   ├── opensearch.go          # OpenSearch bulk index client
-│   │   ├── registry.go            # In-memory job registry with cancellation
-│   │   └── pool.go                # Bounded worker pool
-│   ├── logger/logger.go           # Structured JSON logging via slog
-│   ├── metrics/metrics.go         # Prometheus metrics definitions
-│   ├── middleware/middleware.go    # Auth, rate limit, body limit, access log
-│   ├── retry/retry.go             # Exponential backoff with jitter
-│   ├── storage/s3.go              # S3 client with metrics
+│   │   ├── exporter.go              # S3 scan, decompress, filter, export with retries
+│   │   ├── opensearch.go            # OpenSearch bulk index client
+│   │   ├── registry.go              # In-memory job registry with cancellation
+│   │   └── pool.go                  # Bounded worker pool
+│   ├── index/index.go               # Label index: ChunkIndex model + S3 store
+│   ├── query/
+│   │   ├── parser.go                # Loki-style label selector parser
+│   │   └── query.go                 # Query engine: index lookup + chunk fetch + filter
+│   ├── logger/logger.go             # Structured JSON logging via slog
+│   ├── metrics/metrics.go           # Prometheus metrics definitions
+│   ├── middleware/middleware.go      # Auth, rate limit, body limit, access log
+│   ├── retry/retry.go               # Exponential backoff with jitter
+│   ├── storage/s3.go                # S3 client with metrics + raw key support
 │   └── integration/
-│       └── integration_test.go    # Integration tests (MinIO)
-├── config.json                    # Production config template
-├── config.local.json              # Local dev config (MinIO + OpenSearch)
-├── docker-compose.yml             # MinIO + OpenSearch for local dev
+│       └── integration_test.go      # Integration tests (MinIO)
+├── config.json                      # Production config template
+├── config.local.json                # Local dev config (MinIO + OpenSearch)
+├── docker-compose.yml               # MinIO + OpenSearch for local dev
 └── Makefile
 ```
 
@@ -133,13 +170,23 @@ lokilike/
 - Go 1.21+
 - Docker & Docker Compose
 
-### Local Development
+### One-Command Quickstart
+
+```bash
+./quickstart.sh
+```
+
+This builds the project, starts MinIO + OpenSearch via Docker, launches both services, sends sample log data, and prints the URLs. Press Ctrl+C to stop everything.
+
+### Manual Local Development
 
 ```bash
 make dev-up          # Start MinIO + OpenSearch
-make run-ingester    # Start ingester on :8080
-make run-exporter    # Start exporter on :8081 (separate terminal)
+make run-ingester    # Start ingester on :8080 (terminal 1)
+make run-exporter    # Start exporter on :8081 (terminal 2)
 ```
+
+Open the web UI: **http://localhost:8081/ui**
 
 MinIO console: `http://localhost:9001` (minioadmin/minioadmin)
 
@@ -155,20 +202,58 @@ curl -X POST http://localhost:8080/logs \
         "service": "myapp",
         "level": "info",
         "message": "user logged in",
-        "labels": {"env": "prod", "region": "us-west-2"}
+        "labels": {"app": "nginx", "env": "prod", "cluster": "us-west-2"}
       },
       {
         "timestamp": "2026-03-23T10:01:00Z",
         "service": "myapp",
         "level": "error",
         "message": "database connection timeout",
-        "labels": {"env": "prod"}
+        "labels": {"app": "nginx", "env": "prod"}
       }
     ]
   }'
 ```
 
-### Trigger an Export
+### Query Logs (API)
+
+```bash
+# Search by labels and time range
+curl 'http://localhost:8081/query?start=2026-03-23T00:00:00Z&end=2026-03-24T00:00:00Z&query={app="nginx",env="prod"}&level=error&limit=100'
+```
+
+Response:
+```json
+{
+  "entries": [{"timestamp": "...", "service": "myapp", "level": "error", "message": "...", "labels": {...}}],
+  "stats": {
+    "index_files_scanned": 5,
+    "chunks_matched": 2,
+    "chunks_fetched": 2,
+    "entries_scanned": 500,
+    "entries_matched": 3,
+    "duration_ms": 142
+  }
+}
+```
+
+### Query Logs (Web UI)
+
+Open **http://localhost:8081/ui** and use:
+- Time range pickers for start/end
+- Label query field: `{app="nginx", env="prod"}`
+- Level filter dropdown
+- Click **Search** to query, or **Tail** for live streaming
+
+### Live Tail (WebSocket)
+
+Connect directly via WebSocket for programmatic tailing:
+```bash
+wscat -c 'ws://localhost:8080/tail?query={app="nginx"}&level=error'
+```
+Entries stream as JSON, one per message.
+
+### Export to OpenSearch
 
 ```bash
 # Start an export job
@@ -180,7 +265,6 @@ curl -X POST http://localhost:8081/export \
     "service": "myapp",
     "label_filters": {"env": "prod"}
   }'
-# Returns: {"id": "<job-id>", "status": "pending", ...}
 
 # Poll job status
 curl http://localhost:8081/export/<job-id>
@@ -191,6 +275,100 @@ curl http://localhost:8081/export
 # Cancel a running job
 curl -X DELETE http://localhost:8081/export/<job-id>
 ```
+
+## Label Index
+
+The label index is the key to efficient queries. Instead of scanning every chunk in a time range, the query engine reads lightweight index files first and only fetches chunks that could contain matching entries.
+
+### How It Works
+
+When the ingester flushes a chunk to S3, it also writes a small JSON index file:
+
+```
+S3 bucket:
+  raw_logs/myapp/2026/03/23/1679558400-abc.gz     ← chunk (compressed logs)
+  index/2026/03/23/myapp-1679558400-abc.json       ← index (metadata)
+```
+
+Index file contents:
+```json
+{
+  "chunk_key": "myapp/2026/03/23/1679558400-abc.gz",
+  "service": "myapp",
+  "min_time": "2026-03-23T10:00:00Z",
+  "max_time": "2026-03-23T10:00:30Z",
+  "label_sets": [
+    {"app": "nginx", "env": "prod", "cluster": "us-west-2"},
+    {"app": "nginx", "env": "staging"}
+  ],
+  "entry_count": 847,
+  "size_bytes": 24391,
+  "compression": "gzip"
+}
+```
+
+### Query Path
+
+```
+Without index:  ListObjects(day prefix) → GetObject(ALL chunks) → decompress → filter
+With index:     ListObjects(index prefix) → read small JSONs → filter → GetObject(MATCHING chunks only)
+```
+
+For a query like `{app="nginx", env="prod"}` over 24 hours with 10,000 chunks, the index might narrow it to 50 chunks — a 200x reduction in S3 reads.
+
+### Label Selector Syntax
+
+Loki/Prometheus-style equality matchers:
+
+```
+{app="nginx"}                          # single label
+{app="nginx", env="prod"}             # multiple labels (AND)
+{app="nginx", cluster="us-west-2"}    # any label key/value
+```
+
+The `service` key is treated specially in the query API — it filters by the `service` field on `LogEntry`, not the labels map.
+
+## Web UI
+
+The web UI is an embedded single-page application served at `/ui` on the exporter. No separate build step or deployment required — it's compiled into the Go binary via `embed.FS`.
+
+Features:
+- Dark theme with monospace font
+- Time range pickers (defaults to last hour)
+- Loki-style label query input: `{app="nginx", env="prod"}`
+- Level filter dropdown (debug/info/warn/error/fatal)
+- Result limit control
+- Color-coded log levels (green=info, yellow=warn, red=error)
+- Inline label tags
+- Query performance stats bar
+- **Live tail** toggle — streams entries via WebSocket with auto-scroll
+
+The UI fetches its configuration (ingester WebSocket URL) from `/ui/config` on the exporter.
+
+## Live Tail
+
+The ingester includes a pub/sub broker that fans out ingested entries to WebSocket subscribers in real-time.
+
+### WebSocket Endpoint
+
+```
+WS /tail?query={app="nginx"}&level=error
+```
+
+- Served by the ingester on its listen address (default `:8080`)
+- Supports label filtering and level filtering
+- Each subscriber gets a 256-entry buffered channel
+- Slow consumers drop entries (non-blocking)
+- Automatic cleanup on disconnect
+
+### How It Works
+
+1. Client connects via WebSocket to the ingester's `/tail` endpoint
+2. The query string is parsed into a label filter + level filter
+3. A subscriber is registered with the broker
+4. Every entry accepted by the buffer is published to all matching subscribers
+5. Entries are sent as JSON text messages over the WebSocket
+6. On disconnect, the subscriber is unregistered
 
 ## Configuration
 
@@ -220,6 +398,9 @@ Configuration is JSON with `${ENV_VAR}` expansion.
       "endpoint": "",
       "use_path_style": false,
       "retention_days": 90
+    },
+    "index": {
+      "prefix": "index/"
     }
   },
   "exporter": {
@@ -231,7 +412,8 @@ Configuration is JSON with `${ENV_VAR}` expansion.
       "password": "${OS_PASSWORD}"
     },
     "default_batch_size": 1000,
-    "max_concurrent_jobs": 4
+    "max_concurrent_jobs": 4,
+    "ingester_url": "ws://localhost:8080"
   },
   "auth": { "enabled": true, "api_keys": ["${API_KEY}"] },
   "metrics": { "enabled": true, "address": ":9090" }
@@ -255,13 +437,38 @@ Configuration is JSON with `${ENV_VAR}` expansion.
 | `ingester.min_level` | Drop log entries below this level (e.g., `warn`) | `""` |
 | `storage.s3.endpoint` | Custom S3 endpoint (MinIO/LocalStack) | `""` |
 | `storage.s3.retention_days` | Document S3 lifecycle policy TTL | 90 |
+| `storage.index.prefix` | S3 prefix for label index files | `index/` |
 | `exporter.max_concurrent_jobs` | Max parallel export jobs | 4 |
+| `exporter.ingester_url` | Ingester WebSocket URL for live tail in UI | `ws://localhost:8080` |
 | `auth.enabled` | Require X-API-Key header | `false` |
 | `auth.api_keys` | Valid API keys | `[]` |
 | `metrics.enabled` | Expose Prometheus /metrics | `false` |
 | `metrics.address` | Metrics server listen address | `:9090` |
 
 Config is validated on startup — missing required fields or invalid values will prevent the service from starting.
+
+## API Reference
+
+### Ingester (default `:8080`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/logs` | Ingest log entries |
+| `GET` | `/health` | Health check |
+| `WS` | `/tail?query={...}&level=...` | Live tail via WebSocket |
+
+### Exporter (default `:8081`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/query?start=...&end=...&query={...}&level=...&limit=N` | Query logs from S3 via label index |
+| `POST` | `/export` | Create an export job to OpenSearch |
+| `GET` | `/export` | List all export jobs |
+| `GET` | `/export/{id}` | Get export job status |
+| `DELETE` | `/export/{id}` | Cancel a running export job |
+| `GET` | `/ui` | Web UI |
+| `GET` | `/ui/config` | UI config (ingester WebSocket URL) |
+| `GET` | `/health` | Health check |
 
 ## Production Features
 
@@ -275,63 +482,73 @@ All S3 writes and OpenSearch bulk-index operations retry up to 3 times with expo
 
 ### Flush Failure Retention
 
-If an S3 flush fails, the buffer is **not cleared**. Entries remain in memory (and WAL) for retry on the next flush cycle. Previously, failures silently dropped batches.
+If an S3 flush fails, the buffer is **not cleared**. Entries remain in memory (and WAL) for retry on the next flush cycle.
 
 ### Request Body & Entry Limits
 
-- `max_body_bytes` (default 10MB): Limits HTTP request body via `MaxBytesReader` to prevent OOM from oversized payloads.
-- `max_entries_per_request` (default 10,000): Rejects requests with too many entries (413).
+- `max_body_bytes` (default 10MB): Limits HTTP request body via `MaxBytesReader` to prevent OOM.
+- `max_entries_per_request` (default 10,000): Rejects oversized requests (413).
 
 ### API Key Authentication
 
-Set `auth.enabled: true` and provide API keys. All requests (except `/health` and `/metrics`) require a valid `X-API-Key` header. Keys are configured via the JSON config with env var expansion for secrets.
+Set `auth.enabled: true` and provide API keys. All requests (except `/health` and `/metrics`) require a valid `X-API-Key` header.
 
 ### Rate Limiting
 
-Set `ingester.rate_limit_rps` to enable a token-bucket rate limiter. Excess requests receive `429 Too Many Requests`.
+Set `ingester.rate_limit_rps` to enable a token-bucket rate limiter. Returns `429 Too Many Requests`.
 
 ### TLS
 
-Set `ingester.tls.enabled: true` with `cert_file` and `key_file` to serve HTTPS. Config validation ensures both files are specified when TLS is enabled.
+Set `ingester.tls.enabled: true` with `cert_file` and `key_file` to serve HTTPS.
 
 ### Bounded Export Concurrency
 
-Export jobs are submitted to a worker pool with `max_concurrent_jobs` slots (default 4). If the pool is full, `POST /export` returns `503 Service Unavailable`. Each job gets its own cancellable context.
-
-### Export Job Management
-
-```
-POST   /export         Create an export job (202 Accepted)
-GET    /export          List all jobs
-GET    /export/{id}    Poll job status and progress
-DELETE /export/{id}    Cancel a running job
-```
-
-Jobs track: `chunks_total`, `chunks_processed`, `logs_exported`, `error_count`, and status lifecycle (`pending` → `running` → `completed`/`failed`).
+Export jobs run in a worker pool with `max_concurrent_jobs` slots (default 4). Returns `503` when full.
 
 ### Compression Negotiation
 
-Set `compression_algo` to `gzip` (default) or `snappy`. Snappy is faster for high-throughput workloads; gzip compresses better. The exporter auto-detects compression from the chunk file extension (`.gz` or `.sz`).
+`gzip` (default) or `snappy`. The query engine and exporter auto-detect from file extension (`.gz`/`.sz`).
 
 ### Log Level Sampling
 
-Set `ingester.min_level` (e.g., `warn`) to drop entries below that level during ingestion. Useful for reducing storage costs under high load while keeping error-level visibility.
+Set `ingester.min_level` (e.g., `warn`) to drop entries below that level during ingestion.
 
 ### Multitenancy
 
-Set `tenant_id` to scope all S3 paths under `<prefix>/<tenant_id>/` and isolate data per tenant. Deploy one instance per tenant with different configs.
+Set `tenant_id` to scope all S3 paths (data + index) under `<prefix>/<tenant_id>/`.
 
 ### Structured Logging
 
-All internal logging uses Go's `log/slog` with JSON output to stderr. Every log line includes structured fields (`key`, `entries`, `job_id`, `duration_ms`, etc.) for machine parsing.
+All internal logging uses Go's `log/slog` with JSON output to stderr.
 
 ### Access Logging
 
-Every HTTP request is logged with method, path, status code, duration, and bytes written. Metrics are also recorded per-request.
+Every HTTP request is logged with method, path, status code, duration, and bytes written.
+
+## S3 Key Layout
+
+```
+<bucket>/
+  raw_logs/                         ← data prefix
+    [tenant_id/]
+      myapp/
+        2026/03/23/
+          1679558400-a1b2c3d4.gz    (chunk, gzip)
+          1679558430-e5f6a7b8.sz    (chunk, snappy)
+  index/                            ← index prefix
+    [tenant_id/]
+      2026/03/23/
+        myapp-1679558400-a1b2c3d4.json   (label index)
+        myapp-1679558430-e5f6a7b8.json
+```
+
+### S3 Retention
+
+Set `storage.s3.retention_days` to document your bucket lifecycle policy. **Configure the actual S3 lifecycle rule on the bucket itself** (via Terraform or AWS console).
 
 ## Prometheus Metrics
 
-Enable with `metrics.enabled: true`. Metrics are served at `http://<metrics.address>/metrics`.
+Enable with `metrics.enabled: true`. Served at `http://<metrics.address>/metrics`.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -352,48 +569,64 @@ Enable with `metrics.enabled: true`. Metrics are served at `http://<metrics.addr
 | `lokilike_http_requests_total` | Counter | HTTP requests by method/path/status |
 | `lokilike_http_duration_seconds` | Histogram | HTTP request latency |
 
-## S3 Key Layout
-
-```
-raw_logs/
-  [tenant_id/]
-    myapp/
-      2026/
-        03/
-          23/
-            1679558400-a1b2c3d4.gz   (gzip)
-            1679558430-e5f6a7b8.sz   (snappy)
-```
-
-### S3 Retention
-
-Set `storage.s3.retention_days` as documentation for your bucket lifecycle policy. **You must configure the actual S3 lifecycle rule on the bucket itself** (e.g., via Terraform or the AWS console) to auto-delete objects after N days.
-
 ## Testing
+
+### Quick Start
+
+```bash
+./test.sh
+```
+
+Runs the full test suite in one command: build, vet, 78 unit tests, integration tests (if MinIO is running), and prints per-package coverage.
 
 ### Unit Tests
 
 ```bash
-make test    # 31 tests across ingester, exporter, retry
+make test              # 78 tests, quiet output
+make test-verbose      # with full test names
+make test-coverage     # generate coverage report
 ```
 
-Covers: compression round-trips (gzip + snappy), size/time flush triggers, flush-failure retention, min-level sampling, HTTP handler validation, entry limits, export filtering, time prefix generation, retry logic with context cancellation.
+**78 tests** across 7 packages:
+
+| Package | Tests | Coverage | What's Tested |
+|---------|-------|----------|---------------|
+| `config` | 7 | 94% | Validation (missing fields, bad compression, TLS without certs, auth without keys), defaults, env var expansion |
+| `ingester` | 29 | 73% | Buffer (size/time flush, flush-failure retention, min-level sampling, label collection, snappy), handler (HTTP codes, entry limits), WAL (append/recover/reset), broker (pub/sub, filtering, slow consumers) |
+| `exporter` | 13 | 8% | Entry matching (time, service, labels), time prefix generation |
+| `middleware` | 10 | 67% | API key auth (valid/invalid/missing/exempt paths), rate limiting (burst/reject), body limits (oversized/small), chain ordering |
+| `index` | 12 | 46% | Label matching (exact, subset, mismatch, multi-set), time overlap (full/partial/none/edge), index key format, day prefixes |
+| `query` | 3 | 23% | Label selector parsing (valid syntax, whitespace, invalid inputs) |
+| `retry` | 4 | 86% | First-attempt success, retry-then-succeed, exhaust retries, context cancellation |
 
 ### Integration Tests
 
 ```bash
-make test-integration    # Requires Docker (starts MinIO automatically)
+make dev-up            # start MinIO + OpenSearch
+make test-integration  # run against real S3 (MinIO)
+make test-all          # unit + integration
 ```
 
-Tests S3 round-trip (put/get/list) and full ingest pipeline against MinIO.
+Tests S3 round-trip (put/get/list) and full ingest pipeline (buffer -> compress -> flush to MinIO -> read back -> decompress -> verify).
+
+### Coverage Report
+
+```bash
+make test-coverage
+# Generates coverage.out, prints per-function coverage
+# For HTML: go tool cover -html=coverage.out
+```
 
 ## Makefile
 
 | Target | Description |
 |--------|-------------|
 | `make build` | Compile all packages |
-| `make test` | Run unit tests |
+| `make test` | Run 78 unit tests |
+| `make test-verbose` | Unit tests with full output |
+| `make test-coverage` | Generate coverage report |
 | `make test-integration` | Start Docker, run integration tests |
+| `make test-all` | Unit + integration tests |
 | `make dev-up` / `make dev-down` | Manage local Docker services |
 | `make run-ingester` | Run ingester with local config |
 | `make run-exporter` | Run exporter with local config |
@@ -403,6 +636,7 @@ Tests S3 round-trip (put/get/list) and full ingest pipeline against MinIO.
 - AWS SDK credential resolution: env vars, IAM roles, instance profiles
 - Leave `storage.s3.endpoint` empty for real AWS S3
 - Set `auth.enabled: true` and inject API keys via `${ENV_VARS}`
+- Set `exporter.ingester_url` to the ingester's WebSocket address for the UI's live tail
 - Both services expose `/health` for load balancer health checks
 - WAL directory should be on fast local storage (not NFS)
 - Graceful shutdown: SIGINT/SIGTERM flushes buffer, drains export jobs
