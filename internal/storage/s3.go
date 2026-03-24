@@ -3,9 +3,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,6 +30,25 @@ func NewS3Client(ctx context.Context, cfg appconfig.S3Config) (*S3Client, error)
 	opts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 	}
+
+	// When using a custom endpoint (MinIO, LocalStack), provide a plain
+	// HTTP client so the AWS SDK doesn't try to load system CA bundles
+	// that may not exist (e.g. corporate proxy cert bundles).
+	if cfg.Endpoint != "" {
+		// Clear AWS_CA_BUNDLE if the file doesn't exist, otherwise
+		// LoadDefaultConfig fails before our custom HTTP client takes effect.
+		if caBundle := os.Getenv("AWS_CA_BUNDLE"); caBundle != "" {
+			if _, err := os.Stat(caBundle); os.IsNotExist(err) {
+				os.Unsetenv("AWS_CA_BUNDLE")
+			}
+		}
+		opts = append(opts, awsconfig.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}))
+	}
+
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
