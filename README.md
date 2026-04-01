@@ -190,7 +190,7 @@ make run-exporter    # Start exporter on :8081 (terminal 2)
 
 Open the web UI: **http://localhost:8081/ui**
 
-MinIO console: `http://localhost:9001` (minioadmin/minioadmin)
+MinIO console: `http://localhost:9001` (credentials from `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` env vars)
 
 ### Send Logs
 

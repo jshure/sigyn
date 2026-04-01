@@ -23,8 +23,8 @@
       "region": "us-east-1",
       "prefix": "raw_logs/",
       "endpoint": "http://localhost:9000",
-      "access_key": "minioadmin",
-      "secret_key": "minioadmin",
+      "access_key": "${MINIO_ACCESS_KEY}",
+      "secret_key": "${MINIO_SECRET_KEY}",
       "use_path_style": true,
       "retention_days": 7
     },

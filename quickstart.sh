@@ -4,6 +4,10 @@ set -euo pipefail
 echo "=== sigyn quickstart ==="
 echo ""
 
+# Default MinIO credentials for local dev (override via environment)
+export MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
+export MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
+
 # Check prerequisites
 command -v go >/dev/null 2>&1 || { echo "ERROR: go is required but not installed."; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is required but not installed."; exit 1; }
@@ -46,7 +50,7 @@ echo ""
 echo "  Web UI:        http://localhost:8081/ui"
 echo "  Ingester:      http://localhost:8082 (POST /logs, WS /tail)"
 echo "  Exporter:      http://localhost:8081 (GET /query, POST /export)"
-echo "  MinIO Console: http://localhost:9001 (minioadmin/minioadmin)"
+echo "  MinIO Console: http://localhost:9001 (credentials from MINIO_ACCESS_KEY/MINIO_SECRET_KEY)"
 echo "  Metrics:       http://localhost:9090/metrics"
 echo ""
 echo "  Try: curl 'http://localhost:8081/query?start=2020-01-01T00:00:00Z&end=2030-01-01T00:00:00Z&limit=10'"
